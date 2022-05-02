@@ -1,19 +1,23 @@
 package com.manning.apisecurityinaction;
 
+import static spark.Spark.*;
+
 import java.nio.file.*;
 
-import com.manning.apisecurityinaction.controller.*;
 import org.dalesbred.Database;
 import org.dalesbred.result.EmptyResultException;
 import org.h2.jdbcx.JdbcConnectionPool;
 import org.json.*;
-import spark.*;
 
-import static spark.Spark.*;
+import com.google.common.util.concurrent.RateLimiter;
+import com.manning.apisecurityinaction.controller.*;
+
+import spark.*;
 
 public class Main {
 
     public static void main(String... args) throws Exception {
+        secure("localhost.p12", "changeit", null, null);
         var datasource = JdbcConnectionPool.create(
             "jdbc:h2:mem:natter", "natter", "password");
         var database = Database.forDataSource(datasource);
@@ -23,6 +27,16 @@ public class Main {
 
         database = Database.forDataSource(datasource);
         var spaceController = new SpaceController(database);
+        var userController = new UserController(database);
+        var auditController = new AuditController(database);
+
+        var rateLimiter = RateLimiter.create(2.0d);
+
+        before((request, response) -> {
+            if (!rateLimiter.tryAcquire()) {
+                halt(429);
+            }
+        });
 
         before(((request, response) -> {
             if (request.requestMethod().equals("POST") &&
@@ -44,18 +58,43 @@ public class Main {
             response.header("Server", "");
         });
 
+        before(userController::authenticate);
+
+        before(auditController::auditRequestStart);
+        afterAfter(auditController::auditRequestEnd);
+
+        before("/spaces", userController::requireAuthentication);
         post("/spaces", spaceController::createSpace);
 
         // Additional REST endpoints not covered in the book:
+
+        before("/spaces/:spaceId/messages",
+                userController.requirePermission("POST", "w"));
         post("/spaces/:spaceId/messages", spaceController::postMessage);
+
+        before("/spaces/:spaceId/messages/*",
+                userController.requirePermission("GET", "r"));
         get("/spaces/:spaceId/messages/:msgId",
             spaceController::readMessage);
+
+        before("/spaces/:spaceId/messages",
+                userController.requirePermission("GET", "r"));
         get("/spaces/:spaceId/messages", spaceController::findMessages);
+
+        before("/spaces/:spaceId/members",
+                userController.requirePermission("POST", "rwd"));
+        post("/spaces/:spaceId/members", spaceController::addMember);
 
         var moderatorController =
             new ModeratorController(database);
+
+        before("/spaces/:spaceId/messages/*",
+                userController.requirePermission("DELETE", "d"));
         delete("/spaces/:spaceId/messages/:msgId",
             moderatorController::deletePost);
+
+        get("/logs", auditController::readAuditLog);
+        post("/users", userController::registerUser);
 
         internalServerError(new JSONObject()
             .put("error", "internal server error").toString());
